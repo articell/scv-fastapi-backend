@@ -3,7 +3,10 @@ from hmac import compare_digest
 from typing import Annotated
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from validation_engine import ValidationError, decode_upload, evaluate
+from validation_lab import run_lab
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, StringConstraints
 
@@ -28,7 +31,7 @@ def authenticate(credentials: Annotated[HTTPAuthorizationCredentials | None, Dep
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "engine": "python", "version": "python-migration-1"}
 
 
 @app.post("/postcodes/lookup", dependencies=[Depends(authenticate)])
@@ -67,3 +70,50 @@ def lookup(batch: PostcodeBatch):
         "postcode_release": release,
         "results": {key: "Found" if key in matched else "Not Found" for key in keys},
     }
+
+
+@app.exception_handler(ValidationError)
+async def invalid_file(request: Request, error: ValidationError):
+    return JSONResponse({"message": str(error), "code": error.code}, status_code=400)
+
+
+class ValidationRun(BaseModel):
+    source: str = Field(max_length=20_000_000)
+    selected: list[str] | None = None
+
+
+class LabRun(BaseModel):
+    code: str
+    records: list[dict[str, str]] = Field(max_length=1000)
+    file: str = Field(default="", max_length=20_000_000)
+    condition: dict[str, str] = Field(default_factory=dict)
+
+
+def postcode_lookup(keys):
+    # Pin all chunks to the same release even if the active release changes.
+    unique = list(dict.fromkeys(keys))
+    release = None
+    missing = []
+    for start in range(0, len(unique), 5000):
+        result = lookup(PostcodeBatch(postcode_keys=unique[start:start + 5000], postcode_release=release))
+        release = result["postcode_release"]
+        missing.extend(key for key, status in result["results"].items() if status == "Not Found")
+    return {"release": release, "missing": missing}
+
+
+@app.post("/api/import/inspect", dependencies=[Depends(authenticate)])
+async def inspect_upload(request: Request):
+    body = await request.body()
+    if len(body) > 20_000_000:
+        raise HTTPException(413, "Online test files must be smaller than 20 MB")
+    return decode_upload(body)
+
+
+@app.post("/api/validate", dependencies=[Depends(authenticate)])
+def validate(run: ValidationRun):
+    return evaluate(run.source, run.selected, postcode_lookup)
+
+
+@app.post("/api/lab/run", dependencies=[Depends(authenticate)])
+def lab(run: LabRun):
+    return run_lab(run.code, run.records, run.file, run.condition, postcode_lookup)
