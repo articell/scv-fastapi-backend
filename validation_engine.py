@@ -19,6 +19,9 @@ PERSONAL_REASON = "First forename is blank. The depositor may potentially be an 
 TRIM = "\u0009\u000a\u000b\u000c\u000d \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 UK = re.compile(r"^(?:UK|GB|GBR|U\.?K\.?|UNITED KINGDOM|GREAT BRITAIN|ENGLAND|SCOTLAND|WALES|NORTHERN IRELAND)$", re.I | re.ASCII)
 POSTCODE = re.compile(r"^(?:GIR ?0AA|(?:[A-PR-UWYZ][0-9](?:[0-9]|[A-HJKPSTUW])?|[A-PR-UWYZ][A-HK-Y][0-9](?:[0-9]|[ABEHMNPRVWXY])?) ?[0-9][ABD-HJLNP-UW-Z]{2})$")
+BFPO_POSTCODE = re.compile(r"BF1 ?[0-9][ABD-HJLNP-UW-Z]{2}")
+BFPO_REFERENCE = json.loads(Path(__file__).with_name("bfpo_reference.json").read_text(encoding="utf-8"))
+BFPO_KEYS = frozenset(postcode.upper().replace(" ", "") for postcode in BFPO_REFERENCE["postcodes"])
 SPACE = "[" + re.escape(TRIM) + "-]+"
 PHRASES = ["NO FIXED ADDRESS", "NAME NOT KNOWN", "ADDRESS UNKNOWN", "INVALID ADDRESS",
            "BAD ADDRESS", "NAME UNKNOWN", "NOT PROVIDED", "NO ADDRESS", "NOT KNOWN", "UNKNOWN"]
@@ -159,6 +162,10 @@ def invalid_label(char):
     return char
 
 
+FIRST = "Customer First Forename"
+SURNAME = "Customer Surname or Company Name"
+
+
 def evaluate(source, selected=None, lookup=None):
     selected = [check[0] for check in CHECKS] if selected is None else selected
     if any(code not in {check[0] for check in CHECKS} for code in selected):
@@ -171,11 +178,22 @@ def evaluate(source, selected=None, lookup=None):
     ids, affected = set(), set()
     postcode_rows = {}
 
-    def flag(check, record_index, scvid, group, cells):
+    def flag(check, record_index, scvid, group, cells, fields=()):
         affected_records[check].add(record_index)
         key = json.dumps([scvid, group], ensure_ascii=False)
         if key not in buckets[check]:
             buckets[check][key] = {"id": scvid, "cells": [[] for _ in cells]}
+        if fields:
+            affected_fields = buckets[check][key].setdefault("fields", [])
+            submitted_values = buckets[check][key].setdefault("submittedValues", {})
+            for field in fields:
+                if field not in affected_fields:
+                    affected_fields.append(field)
+                value = records[record_index][index[field]]
+                display_value = value if trim(value) else "[BLANK]"
+                values = submitted_values.setdefault(field, [])
+                if display_value not in values:
+                    values.append(display_value)
         for previous, values in zip(buckets[check][key]["cells"], cells):
             for value in values:
                 if value not in previous:
@@ -211,27 +229,35 @@ def evaluate(source, selected=None, lookup=None):
             if reasons:
                 flag(0, record_index, scvid, "", [[scvid], reasons])
         if enabled[1]:
-            reasons, actions = [], []
+            reasons, actions, fields = [], [], []
 
-            def name_failure(reason, action=GENERIC):
+            def name_failure(reason, affected_fields, action=GENERIC):
                 reasons.append(reason)
                 actions.append(action)
+                fields.extend(affected_fields)
 
             if blank(surname):
-                name_failure("First Forename and Surname are blank" if blank(first) else "Surname is blank")
+                if blank(first):
+                    name_failure("First Forename and Surname are blank", [FIRST, SURNAME])
+                else:
+                    name_failure("Surname is blank", [SURNAME])
             elif blank(first):
                 if any(not blank(value) for value in (second, third, dob, ni)):
-                    name_failure(PERSONAL_REASON)
+                    name_failure(PERSONAL_REASON, [FIRST])
                 elif blank(number):
-                    name_failure("Surname is populated, but First Forename and Company Number fields are blank.", COMPANY)
+                    name_failure("Surname is populated, but First Forename and Company Number fields are blank.", [FIRST, "Company Number"], COMPANY)
             name = surname.strip(" ")
             if len(name) == 1 and unicodedata.category(name).startswith("L"):
-                name_failure("Surname contains only one letter. Please check this is correct.")
+                name_failure("Surname contains only one letter. Please check this is correct.", [SURNAME])
             has_digit = lambda value: any(unicodedata.category(char) == "Nd" for char in value)
-            if any(has_digit(value) for value in (first, second, third)) or (blank(number) and has_digit(surname)):
-                name_failure(NUMERIC)
+            numeric_fields = [field for field, value in (
+                (FIRST, first), ("Customer Second Forename", second), ("Customer Third Forename", third),
+                (SURNAME, surname if blank(number) else ""),
+            ) if has_digit(value)]
+            if numeric_fields:
+                name_failure(NUMERIC, numeric_fields)
             if reasons:
-                flag(1, record_index, scvid, "", [[scvid], [status], reasons, actions])
+                flag(1, record_index, scvid, "", [[scvid], [status], reasons, actions], fields)
         if enabled[2]:
             title_blank = blank(title)
             invalid = blank(number) if title_blank else title_key(title) not in TITLES
@@ -240,18 +266,23 @@ def evaluate(source, selected=None, lookup=None):
         if enabled[4]:
             country, postcode = trim(get("Country")), trim(get("Post Code"))
 
-            def flag_address(reason):
-                flag(4, record_index, scvid, reason, [[scvid], [status], [postcode or "[Blank]"], [reason]])
+            def flag_address(reason, field="Post Code"):
+                flag(4, record_index, scvid, reason, [[scvid], [status], [postcode or "[Blank]"], [reason]], [field])
 
             for field in ("Address Line 1", "Address Line 2"):
                 if not trim(get(field)):
-                    flag_address(field + " is missing")
-            if not country or UK.fullmatch(country):
-                upper = postcode.upper()
+                    flag_address(field + " is missing", field)
+            upper = postcode.upper()
+            if upper.startswith("BF1"):
+                if not re.fullmatch("[A-Za-z0-9 ]+", postcode) or not BFPO_POSTCODE.fullmatch(upper):
+                    flag_address("UK postcode has an invalid format")
+                elif upper.replace(" ", "") not in BFPO_KEYS:
+                    flag_address("BFPO postcode is not in the reference list; manual verification required.")
+            elif not country or UK.fullmatch(country):
                 if not postcode:
-                    flag_address("Missing")
+                    flag_address("UK postcode is missing")
                 elif not re.fullmatch("[A-Za-z0-9 ]+", postcode) or not POSTCODE.fullmatch(upper):
-                    flag_address("Invalid format")
+                    flag_address("UK postcode has an invalid format")
                 else:
                     key = upper.replace(" ", "")
                     postcode_rows.setdefault(key, []).append((record_index, scvid, status, postcode))
@@ -295,7 +326,8 @@ def evaluate(source, selected=None, lookup=None):
         release = response["release"]
         for key in response["missing"]:
             for row_index, scvid, status, postcode in postcode_rows[key]:
-                flag(4, row_index, scvid, "Not Found", [[scvid], [status], [postcode], ["Not Found"]])
+                reason = "UK postcode was not found in the postcode reference dataset"
+                flag(4, row_index, scvid, reason, [[scvid], [status], [postcode], [reason]], ["Post Code"])
     result = {
         "records": len(records), "ids": len(ids), "affected": len(affected),
         "checksRun": [check[0] for check, active in zip(CHECKS, enabled) if active],
