@@ -1,4 +1,5 @@
 """SCV parsing and validation shared by submissions and the Testing Lab."""
+from decimal import Decimal, localcontext
 import json
 from pathlib import Path
 import re
@@ -9,6 +10,12 @@ CHECKS = CATALOGUE["checks"]
 LAYOUT51 = CATALOGUE["layout51"]
 REPEATED = (13, 26, 48)
 LAYOUT48 = [field for i, field in enumerate(LAYOUT51) if i not in REPEATED]
+FIELD_MAX_LENGTHS = CATALOGUE["fieldMaxLengths"]
+LENGTH_CHECK = next(i for i, check in enumerate(CHECKS) if check[0] == "FFSTP_4")
+DEPOSIT_CHECK = next(i for i, check in enumerate(CHECKS) if check[0] == "DQ_4")
+SPEECH_MARKS_CHECK = next(i for i, check in enumerate(CHECKS) if check[0] == "FFSTP_5")
+AGGREGATE_CHECK = next(i for i, check in enumerate(CHECKS) if check[0] == "FFSTP_6D")
+GRADING_CHECKS = {i for i, (code, _, _) in enumerate(CHECKS) if code.startswith("FFSTP_") or code == "DQ_34"}
 MARKER = "9" * 20
 IMPORT_REASON = "Invalid or missing end-of-file marker. Every SCV file must end with exactly twenty consecutive 9s on the final line."
 GENERIC = "Please update the missing/incorrectly populated name detail(s) based on whether is an individual or non-personal record"
@@ -54,8 +61,15 @@ def title_key(value):
 TITLES = {title_key(value) for value in CATALOGUE["titles"]}
 
 
-def parse(source, delimiter):
+def speech_marks_reason(submitted_value):
+    if any(mark in submitted_value for mark in ('"', "\u201c", "\u201d")):
+        return "Speech marks were found."
+    return None
+
+
+def parse(source, delimiter, *, submitted_rows=None):
     rows, row, field = [], [], []
+    submitted_row, field_start = [], 0
     quoted = closed = False
     i = 0
     while i < len(source):
@@ -70,29 +84,40 @@ def parse(source, delimiter):
                 quoted, closed = False, True
         elif char == delimiter or char in "\r\n":
             row.append("".join(field))
+            if submitted_rows is not None:
+                submitted_row.append(source[field_start:i])
             field, closed = [], False
             if char in "\r\n":
                 if char == "\r" and i + 1 < len(source) and source[i + 1] == "\n":
                     i += 1
                 if len(row) > 1 or row[0]:
                     rows.append(row)
-                row = []
+                    if submitted_rows is not None:
+                        submitted_rows.append(submitted_row)
+                row, submitted_row = [], []
+            field_start = i + 1
         elif closed:
-            raise ValidationError("Unexpected text after a quoted field.")
+            raise ValidationError(
+                f"Invalid quotation marks in row {len(rows) + 1}, column {len(row) + 1}: "
+                "unexpected text after the closing double quotation mark.", "FAILED_IMPORT")
         elif char == '"' and not field:
             quoted = True
         else:
             field.append(char)
         i += 1
     if quoted:
-        raise ValidationError("A quoted field was not closed.")
+        raise ValidationError(
+            f"Invalid quotation marks in row {len(rows) + 1}, column {len(row) + 1}: "
+            "the opening double quotation mark was not closed.", "FAILED_IMPORT")
     row.append("".join(field))
     if len(row) > 1 or row[0]:
         rows.append(row)
+        if submitted_rows is not None:
+            submitted_rows.append([*submitted_row, source[field_start:]])
     return rows
 
 
-def parse_file(source):
+def parse_file(source, *, submitted_rows=None):
     source = source.removeprefix("\ufeff")
     file = re.sub(r"\r?\n\Z", "", source)
     boundary = file.rfind("\n")
@@ -109,7 +134,7 @@ def parse_file(source):
                 separator, width = candidate, candidate_width
         except ValidationError:
             pass
-    parsed = parse(records_text, separator)
+    parsed = parse(records_text, separator, submitted_rows=submitted_rows)
     if not parsed:
         raise ValidationError("The file is empty.")
     headers, records = parsed[0], parsed[1:]
@@ -164,6 +189,90 @@ def invalid_label(char):
 
 FIRST = "Customer First Forename"
 SURNAME = "Customer Surname or Company Name"
+PENNY_AMOUNT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]{1,2})?|\.[0-9]{1,2})")
+SORT_CODE_FORMAT = re.compile(r"[0-9]{6}|[0-9]{2}([ -])[0-9]{2}\1[0-9]{2}")
+COMPLETE_IBAN = re.compile(r"[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}")
+BIC_FORMAT = re.compile(r"[A-Z0-9]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?")
+IBAN_LENGTHS = CATALOGUE["ibanReference"]["lengths"]
+REPEATED_ACCOUNT_REASON = "Aggregate Balance could not be verified because repeated customer/account rows require review."
+
+
+def penny_amount(value):
+    amount = trim(value)
+    return Decimal(amount) if PENNY_AMOUNT.fullmatch(amount) else None
+
+
+def valid_iban(iban):
+    if not COMPLETE_IBAN.fullmatch(iban) or len(iban) != IBAN_LENGTHS.get(iban[:2]):
+        return False
+    if not 2 <= int(iban[2:4]) <= 98:
+        return False
+    # ISO IBAN checksum: move country and check digits to the end, then expand letters.
+    reordered = iban[4:] + iban[:4]
+    digits = "".join(str(ord(char) - 55) if char.isalpha() else char for char in reordered)
+    return int(digits) % 97 == 1
+
+
+def account_identifiers(sort_code, account_number, iban, bic):
+    sort_code, account_number = trim(sort_code), trim(account_number)
+    malformed = []
+    if sort_code:
+        if not SORT_CODE_FORMAT.fullmatch(sort_code):
+            malformed.append("Sort Code")
+        elif account_number:
+            return ("sort", re.sub(r"[ -]", "", sort_code), account_number), malformed
+    iban = trim(iban).replace(" ", "")
+    if iban:
+        if iban.isascii() and valid_iban(iban.upper()):
+            return ("iban", iban.upper()), malformed
+        malformed.append("IBAN")
+    bic = trim(bic)
+    if bic:
+        if not (bic.isascii() and BIC_FORMAT.fullmatch(bic.upper())):
+            malformed.append("BIC")
+        elif account_number:
+            return ("bic", bic.upper(), account_number), malformed
+    return None, malformed
+
+
+def aggregate_findings(records, index, row_indices):
+    entries = []
+    seen_accounts = set()
+    repeated = False
+    for row_index in row_indices:
+        record = records[row_index]
+        get = lambda field: record[index[field]]
+        identity, malformed = account_identifiers(get("Sort Code"), get("Account Number"), get("IBAN"), get("BIC"))
+        submitted = get("Aggregate Balance")
+        for field in malformed:
+            yield row_index, submitted, "", "", f"{field} is malformed; please review the account identifier.", False
+        if identity is not None:
+            repeated |= identity in seen_accounts
+            seen_accounts.add(identity)
+        entries.append((row_index, get("Account Balance in Sterling"), submitted))
+
+    amounts = [penny_amount(sterling) for _, sterling, _ in entries]
+    if repeated or any(amount is None for amount in amounts):
+        reason = REPEATED_ACCOUNT_REASON if repeated else (
+            "Aggregate Balance could not be verified because an Account Balance in Sterling is blank or invalid.")
+        for row_index, _, submitted in entries:
+            yield row_index, submitted, "", "", reason, False
+        return
+
+    # Include enough digits for the largest input and any carry from summing the group.
+    with localcontext() as context:
+        max_input_length = max(len(value) for _, sterling, submitted in entries for value in (sterling, submitted))
+        context.prec = max_input_length + len(str(len(entries))) + 4
+        expected = sum((amount for amount in amounts if amount > 0), Decimal(0))
+        expected_text = f"{expected:.2f}"
+        for row_index, _, submitted in entries:
+            actual = penny_amount(submitted)
+            if actual is None:
+                yield (row_index, submitted, expected_text, "",
+                       "Aggregate Balance could not be verified because the submitted Aggregate Balance is blank or invalid.", False)
+            elif actual != expected:
+                yield (row_index, submitted, expected_text, f"{abs(actual - expected):.2f}",
+                       "Submitted Aggregate Balance differs from the sum of positive Account Balances in Sterling.", True)
 
 
 def evaluate(source, selected=None, lookup=None):
@@ -171,15 +280,22 @@ def evaluate(source, selected=None, lookup=None):
     if any(code not in {check[0] for check in CHECKS} for code in selected):
         raise ValidationError("An unavailable validation check was selected.")
     enabled = [check[0] in selected for check in CHECKS]
-    headers, records = parse_file(source)
+    submitted_rows = [] if enabled[SPEECH_MARKS_CHECK] else None
+    headers, records = parse_file(source, submitted_rows=submitted_rows)
     index = {heading: headers.index(heading) for heading in headers}
     buckets = [{} for _ in CHECKS]
     affected_records = [set() for _ in CHECKS]
+    grading_affected_records = [set() for _ in CHECKS]
     ids, affected = set(), set()
+    grading_affected = set()
     postcode_rows = {}
+    aggregate_rows = {}
 
-    def flag(check, record_index, scvid, group, cells, fields=()):
+    def flag(check, record_index, scvid, group, cells, fields=(), grading_eligible=True):
         affected_records[check].add(record_index)
+        if grading_eligible and check in GRADING_CHECKS:
+            grading_affected_records[check].add(record_index)
+            grading_affected.add(scvid)
         key = json.dumps([scvid, group], ensure_ascii=False)
         if key not in buckets[check]:
             buckets[check][key] = {"id": scvid, "cells": [[] for _ in cells]}
@@ -199,6 +315,7 @@ def evaluate(source, selected=None, lookup=None):
                 if value not in previous:
                     previous.append(value)
         affected.add(scvid)
+        return buckets[check][key]
 
     for record_index, record in enumerate(records):
         if len(record) != len(headers):
@@ -211,23 +328,49 @@ def evaluate(source, selected=None, lookup=None):
         if len(headers) == 51 and any(record[i] != raw_id for i in REPEATED):
             raise ValidationError(f"Record {record_index + 1} has inconsistent repeated SCVID values.")
         ids.add(scvid)
+        if enabled[AGGREGATE_CHECK]:
+            aggregate_rows.setdefault(scvid, []).append(record_index)
         status, title = get("Account Status Code"), get("Title")
         first, second, third, surname = [get(field) for field in [
             "Customer First Forename", "Customer Second Forename", "Customer Third Forename", "Customer Surname or Company Name"]]
         dob, ni, number = get("Customer Date of Birth"), get("National Insurance Number"), get("Company Number")
         if enabled[0]:
-            reasons = []
+            findings = []
             for label in ("Aggregate Balance", "Compensatable Amount"):
                 value = get(label)
                 if blank(value):
-                    reasons.append("Blank " + label)
-                elif re.fullmatch(r" *[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+) *", value):
+                    reason_code = "missing"
+                elif not re.fullmatch(r" *[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+) *", value):
+                    continue
+                else:
                     if not re.search("[1-9]", value):
-                        reasons.append("Zero " + label)
+                        reason_code = "zero"
                     elif value.lstrip(TRIM).startswith("-"):
-                        reasons.append("Negative " + label)
-            if reasons:
-                flag(0, record_index, scvid, "", [[scvid], reasons])
+                        reason_code = "negative"
+                    else:
+                        continue
+                reason = label + " is " + reason_code
+                if reason_code == "zero":
+                    reason += "—reported for review; may be valid"
+                findings.append({"field": label, "reasonCode": reason_code, "reason": reason,
+                                 "gradingEligible": reason_code in {"missing", "negative"},
+                                 "accountStatusCodes": [status],
+                                 "submittedValues": [value if reason_code != "missing" else "[BLANK]"]})
+            if findings:
+                row = flag(0, record_index, scvid, "", [[scvid], [f["reason"] for f in findings]],
+                           grading_eligible=any(f["gradingEligible"] for f in findings))
+                grouped = row.setdefault("findings", [])
+                for finding in findings:
+                    existing = next((item for item in grouped if
+                                     (item["field"], item["reasonCode"]) ==
+                                     (finding["field"], finding["reasonCode"])), None)
+                    if existing is None:
+                        grouped.append(finding)
+                        continue
+                    for key in ("accountStatusCodes", "submittedValues"):
+                        value = finding[key][0]
+                        if value not in existing[key]:
+                            existing[key].append(value)
         if enabled[1]:
             reasons, actions, fields = [], [], []
 
@@ -317,7 +460,43 @@ def evaluate(source, selected=None, lookup=None):
             for i, value in enumerate(record):
                 invalid = list(dict.fromkeys(invalid_label(char) for char in value if ord(char) < 32 or ord(char) > 127))
                 if invalid:
-                    flag(3, record_index, scvid, i, [[scvid], [status], [headers[i]], invalid, ["Please check if this character is correct"]])
+                    row = flag(3, record_index, scvid, i,
+                               [[scvid], [status], [headers[i]], invalid, ["Please check if this character is correct"]])
+                    values = row.setdefault("submittedValues", {}).setdefault(headers[i], [])
+                    if value not in values:
+                        values.append(value)
+        if enabled[LENGTH_CHECK]:
+            for field, limit in FIELD_MAX_LENGTHS.items():
+                value = get(field)
+                length = len(value)
+                if length > limit:
+                    reason = f"{field} exceeds the maximum length of {limit} characters ({length} submitted)."
+                    flag(LENGTH_CHECK, record_index, scvid, [record_index, field, "overlength"],
+                         [[scvid], [status], [field], [value], [reason]])
+                if "  " in value:
+                    reason = f"{field} contains consecutive spaces; please review."
+                    flag(LENGTH_CHECK, record_index, scvid, [record_index, field, "spacing"],
+                         [[scvid], [status], [field], [value], [reason]], grading_eligible=False)
+        if submitted_rows is not None:
+            submitted_record = submitted_rows[record_index + 1]
+            for field_index, (field, value) in enumerate(zip(headers, submitted_record)):
+                reason = speech_marks_reason(value)
+                if reason:
+                    flag(SPEECH_MARKS_CHECK, record_index, scvid, [record_index, field_index],
+                         [[scvid], [status], [field], [value], [reason]])
+        if enabled[DEPOSIT_CHECK]:
+            field = "Transferable Eligible Deposit"
+            value = get(field)
+            amount = trim(value)
+            if amount not in {"", "0", "0.00"}:
+                reason = field + " must be blank, 0 or 0.00."
+                flag(DEPOSIT_CHECK, record_index, scvid, value,
+                     [[scvid], [status], [field], [value], [reason]])
+    for scvid, row_indices in aggregate_rows.items():
+        for row_index, submitted, expected, difference, reason, grade in aggregate_findings(records, index, row_indices):
+            status = records[row_index][index["Account Status Code"]]
+            flag(AGGREGATE_CHECK, row_index, scvid, [submitted, expected, difference, reason],
+                 [[scvid], [status], [submitted], [expected], [difference], [reason]], grading_eligible=grade)
     release = None
     if postcode_rows:
         if lookup is None:
@@ -332,6 +511,8 @@ def evaluate(source, selected=None, lookup=None):
         "records": len(records), "ids": len(ids), "affected": len(affected),
         "checksRun": [check[0] for check, active in zip(CHECKS, enabled) if active],
         "affectedRecords": [len(rows) for rows in affected_records],
+        "gradingAffected": len(grading_affected),
+        "gradingAffectedRecords": [len(rows) for rows in grading_affected_records],
         "results": [list(bucket.values()) for bucket in buckets],
     }
     if release:

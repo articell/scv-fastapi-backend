@@ -1,5 +1,8 @@
 """Testing Lab adapter using the production Python engine."""
-from validation_engine import CHECKS, CATALOGUE, ValidationError, evaluate, make_test_file, trim
+from validation_engine import (
+    CHECKS, CATALOGUE, IMPORT_REASON, LAYOUT48, ValidationError, evaluate,
+    make_test_file, speech_marks_reason, trim,
+)
 
 FIRST = "Customer First Forename"
 SURNAME = "Customer Surname or Company Name"
@@ -27,16 +30,34 @@ def run_lab(code, records, file, condition, lookup):
         except ValidationError as error:
             if error.code != "FAILED_IMPORT":
                 raise
-            return {"findings": [{"id": "File", "field": "Final line", "reason": str(error)}], "records": 0}
+            field = "Final line" if str(error) == IMPORT_REASON else "Quotation marks"
+            return {"findings": [{"id": "File", "field": field, "reason": str(error)}], "records": 0}
     codes = [check[0] for check in CHECKS]
     if code not in codes:
         raise ValidationError("This check cannot run because its validation logic is unavailable.")
+    if code == "FFSTP_5":
+        if not records:
+            raise ValidationError("The file has headings but no records.")
+        findings = []
+        for i, record in enumerate(records, 1):
+            scvid = record.get("SCVID", "").strip(" ")
+            if not scvid:
+                raise ValidationError(f"Record {i} is missing an SCVID.")
+            for field in LAYOUT48:
+                value = record.get(field, "")
+                reason = speech_marks_reason(value)
+                if reason:
+                    findings.append({"id": scvid, "field": field, "submittedValue": value, "reason": reason})
+        return {"findings": findings, "records": len(records)}
     result = evaluate(make_test_file(records), [code], lookup)
     findings = []
     for row in result["results"][codes.index(code)]:
         scvid, cells = row["id"], row["cells"]
-        if code in {"DQ_24", "DQ_27"}:
+        if code in {"DQ_4", "DQ_24", "DQ_27", "FFSTP_4"}:
             findings.extend({"id": scvid, "field": cells[2][0], "reason": reason} for reason in cells[4])
+        elif code == "FFSTP_6D":
+            findings.append({"id": scvid, "field": "Aggregate Balance", "submittedValue": cells[2][0],
+                             "expectedValue": cells[3][0], "difference": cells[4][0], "reason": cells[5][0]})
         elif code == "DQ_1":
             findings.append({"id": scvid, "field": cells[2][0], "reason": "Non-standard characters: " + ", ".join(cells[3])})
         elif code == "FFSTP_10":
@@ -62,6 +83,8 @@ def run_lab(code, records, file, condition, lookup):
             for reason in cells[3]:
                 field = reason.removesuffix(" is missing") if reason.startswith("Address Line") else "Post Code"
                 findings.append({"id": scvid, "field": field, "reason": reason})
-        else:
-            findings.extend({"id": scvid, "field": reason.split(" ", 1)[1], "reason": reason} for reason in cells[1])
+        elif code == "FFSTP_2D":
+            findings.extend({"id": scvid, "field": finding["field"], "reason": finding["reason"],
+                             "reasonCode": finding["reasonCode"], "gradingEligible": finding["gradingEligible"]}
+                            for finding in row["findings"])
     return {"findings": findings, "records": result["records"]}
